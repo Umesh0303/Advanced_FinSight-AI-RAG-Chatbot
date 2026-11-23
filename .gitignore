@@ -1,0 +1,21 @@
+# Virtual environments
+venv/
+.venv/
+
+# Environment secrets
+.env
+.env.*
+!.env.example
+
+# Python cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Persistent vector database
+vectorstore/chroma_db/
+
+# IDE and operating system files
+.vscode/
+.DS_Store
+Thumbs.db

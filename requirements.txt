@@ -1,0 +1,11 @@
+langchain
+langchain-core
+langchain-community
+langchain-groq
+langchain-google-genai
+langchain-chroma
+chromadb
+pypdf
+docx2txt
+python-dotenv
+pytest
