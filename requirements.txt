@@ -9,3 +9,7 @@ pypdf
 docx2txt
 python-dotenv
 pytest
+fastapi
+uvicorn[standard]
+PyJWT[crypto]
+httpx

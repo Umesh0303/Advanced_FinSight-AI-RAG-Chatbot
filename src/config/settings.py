@@ -22,6 +22,15 @@ GROQ_MODEL: Final[str | None] = os.getenv("GROQ_MODEL")
 INGESTION_MANIFEST_HMAC_KEY: Final[str | None] = os.getenv(
     "INGESTION_MANIFEST_HMAC_KEY"
 )
+SUPABASE_URL: Final[str | None] = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_ROLE_KEY: Final[str | None] = os.getenv(
+    "SUPABASE_SERVICE_ROLE_KEY"
+)
+SUPABASE_JWT_AUDIENCE: Final[str] = os.getenv(
+    "SUPABASE_JWT_AUDIENCE",
+    "authenticated",
+)
+API_CORS_ORIGINS: Final[str] = os.getenv("API_CORS_ORIGINS", "")
 
 # Project data and storage paths.
 UPLOADS_DIR: Final[Path] = PROJECT_ROOT / "data" / "uploads"

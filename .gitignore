@@ -19,3 +19,6 @@ vectorstore/chroma_db/
 .vscode/
 .DS_Store
 Thumbs.db
+# Local ingestion state and quarantined documents
+data/ingestion_manifest.json
+data/unclassified/
