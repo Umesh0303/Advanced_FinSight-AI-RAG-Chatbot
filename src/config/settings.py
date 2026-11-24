@@ -35,7 +35,12 @@ API_CORS_ORIGINS: Final[str] = os.getenv("API_CORS_ORIGINS", "")
 # Project data and storage paths.
 UPLOADS_DIR: Final[Path] = PROJECT_ROOT / "data" / "uploads"
 UNCLASSIFIED_DIR: Final[Path] = PROJECT_ROOT / "data" / "unclassified"
-CHROMA_DB_DIR: Final[Path] = PROJECT_ROOT / "vectorstore" / "chroma_db"
+_chroma_db_dir = os.getenv("CHROMA_DB_DIR")
+CHROMA_DB_DIR: Final[Path] = (
+    Path(_chroma_db_dir)
+    if _chroma_db_dir and _chroma_db_dir.strip()
+    else PROJECT_ROOT / "vectorstore" / "chroma_db"
+)
 
 # Roles and their matching logical ChromaDB collections.
 ALLOWED_ROLES: Final[tuple[str, ...]] = (
