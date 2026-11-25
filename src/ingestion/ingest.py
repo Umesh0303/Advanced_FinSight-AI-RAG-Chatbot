@@ -14,7 +14,9 @@ from src.config.settings import (
     ALLOWED_ROLES,
     INGESTION_MANIFEST_HMAC_KEY,
     PROJECT_ROOT,
+    SUPPORTED_DOCUMENT_EXTENSIONS,
     UNCLASSIFIED_DIR,
+    UPLOADS_DIR,
 )
 from src.ingestion.document_loader import load_document
 from src.ingestion.role_classifier import (
@@ -1076,3 +1078,36 @@ def ingest_document(
         False,
         boundary_method,
     )
+
+
+def _collection_is_empty(collection: Any) -> bool:
+    """Return True when a Chroma collection contains no stored chunks."""
+
+    result = collection.get(limit=1, include=[])
+    ids = result.get("ids") if isinstance(result, Mapping) else None
+    return not ids
+
+
+def ingest_uploads_if_empty(
+    collections: Mapping[str, Any],
+    uploads_dir: Path | None = None,
+) -> list[dict[str, Any]]:
+    """Ingest supported upload documents when all vector collections are empty."""
+
+    if not collections or not all(
+        _collection_is_empty(collection) for collection in collections.values()
+    ):
+        return []
+
+    target_dir = UPLOADS_DIR if uploads_dir is None else uploads_dir
+    if not target_dir.is_dir():
+        return []
+
+    summaries: list[dict[str, Any]] = []
+    for candidate in sorted(target_dir.iterdir(), key=lambda path: path.name):
+        if (
+            candidate.is_file()
+            and candidate.suffix.lower() in SUPPORTED_DOCUMENT_EXTENSIONS
+        ):
+            summaries.append(ingest_document(candidate))
+    return summaries

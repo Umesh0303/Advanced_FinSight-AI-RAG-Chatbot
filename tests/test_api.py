@@ -581,3 +581,71 @@ def test_resources_initialize_once_per_application_lifespan():
 def test_invalid_cors_origins_are_rejected(origin):
     with pytest.raises(ValueError, match="exact HTTP\\(S\\) origins"):
         create_app(resources_factory=dict, cors_origins=[origin])
+
+
+def test_ingest_uploads_if_empty_skips_populated_collections(tmp_path, monkeypatch):
+    from src.ingestion import ingest
+
+    (tmp_path / "manual.pdf").write_bytes(b"%PDF-1.4")
+    called = []
+    monkeypatch.setattr(ingest, "ingest_document", lambda path: called.append(path))
+
+    class StubCollection:
+        def __init__(self, ids):
+            self._ids = ids
+
+        def get(self, limit=1, include=None):
+            return {"ids": self._ids[:limit]}
+
+    collections = {
+        "admin": StubCollection(["chunk-1"]),
+        "customer": StubCollection([]),
+    }
+
+    assert ingest.ingest_uploads_if_empty(collections, uploads_dir=tmp_path) == []
+    assert called == []
+
+
+def test_ingest_uploads_if_empty_ingests_supported_files(tmp_path, monkeypatch):
+    from src.ingestion import ingest
+
+    pdf_file = tmp_path / "b_manual.pdf"
+    txt_file = tmp_path / "a_notes.txt"
+    ignored_file = tmp_path / "ignore.csv"
+    pdf_file.write_bytes(b"%PDF-1.4")
+    txt_file.write_text("notes", encoding="utf-8")
+    ignored_file.write_text("a,b", encoding="utf-8")
+
+    ingested = []
+
+    def fake_ingest(path):
+        ingested.append(path)
+        return {"document_id": path.name}
+
+    monkeypatch.setattr(ingest, "ingest_document", fake_ingest)
+
+    class EmptyCollection:
+        def get(self, limit=1, include=None):
+            return {"ids": []}
+
+    collections = {"admin": EmptyCollection(), "customer": EmptyCollection()}
+
+    summaries = ingest.ingest_uploads_if_empty(collections, uploads_dir=tmp_path)
+    assert ingested == [txt_file, pdf_file]
+    assert summaries == [{"document_id": "a_notes.txt"}, {"document_id": "b_manual.pdf"}]
+
+
+def test_initialize_api_resources_continues_if_startup_ingestion_fails(monkeypatch):
+    import src.api.main as api_main
+
+    fake_collections = {"admin": object()}
+    monkeypatch.setattr(api_main.settings, "validate_api_configuration", lambda: None)
+    monkeypatch.setattr(api_main, "get_embedding_model", lambda: object())
+    monkeypatch.setattr(api_main, "initialize_collections", lambda embedding_model: fake_collections)
+    monkeypatch.setattr(
+        api_main,
+        "ingest_uploads_if_empty",
+        lambda collections: (_ for _ in ()).throw(RuntimeError("missing hmac key")),
+    )
+
+    assert api_main.initialize_api_resources() is fake_collections

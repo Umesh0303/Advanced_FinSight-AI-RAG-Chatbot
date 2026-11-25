@@ -14,6 +14,7 @@ from fastapi.responses import JSONResponse
 from src.api.routes import chat, health
 from src.config import settings
 from src.embeddings.embedding_model import get_embedding_model
+from src.ingestion.ingest import ingest_uploads_if_empty
 from src.vectorstore.chroma_store import initialize_collections
 
 
@@ -64,7 +65,19 @@ def initialize_api_resources() -> dict[str, Any]:
 
     settings.validate_api_configuration()
     embedding_model = get_embedding_model()
-    return initialize_collections(embedding_model=embedding_model)
+    collections = initialize_collections(embedding_model=embedding_model)
+    try:
+        summaries = ingest_uploads_if_empty(collections)
+        if summaries:
+            logger.info(
+                "Ingested %d document(s) into empty vector collections.",
+                len(summaries),
+            )
+    except Exception:
+        logger.exception(
+            "Startup document ingestion failed; vectorstore collections remain empty."
+        )
+    return collections
 
 
 def create_app(

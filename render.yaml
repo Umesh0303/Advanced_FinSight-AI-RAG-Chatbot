@@ -1,4 +1,4 @@
-﻿services:
+services:
   - type: web
     name: finsight-rag-api
     runtime: python
@@ -16,6 +16,9 @@
         sync: false
 
       - key: GOOGLE_API_KEY
+        sync: false
+
+      - key: INGESTION_MANIFEST_HMAC_KEY
         sync: false
 
       - key: GROQ_MODEL
