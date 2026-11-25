@@ -1,0 +1,37 @@
+﻿services:
+  - type: web
+    name: finsight-rag-api
+    runtime: python
+    plan: free
+    branch: main
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn src.api.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /health
+
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.13.14
+
+      - key: GROQ_API_KEY
+        sync: false
+
+      - key: GOOGLE_API_KEY
+        sync: false
+
+      - key: GROQ_MODEL
+        value: openai/gpt-oss-20b
+
+      - key: SUPABASE_URL
+        value: https://ncfzjltffljconwihvpk.supabase.co
+
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+
+      - key: SUPABASE_JWT_AUDIENCE
+        value: authenticated
+
+      - key: API_CORS_ORIGINS
+        value: https://finsight-ai-1054.ai.studio
+
+      - key: CHROMA_DB_DIR
+        value: /tmp/finsight_chroma_db
