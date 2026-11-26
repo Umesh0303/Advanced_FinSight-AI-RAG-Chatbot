@@ -221,3 +221,68 @@ def retrieve_documents(
                 break
 
     return authorized_docs
+
+
+def retrieve_documents_pgvector(
+    query: str,
+    role: str,
+    embedding_model: Any | None = None,
+    top_k: int = 5,
+) -> list[Document]:
+    """Embed query and retrieve authorized chunks from Supabase pgvector."""
+
+    from src.embeddings.embedding_model import (
+        EMBEDDING_DIMENSIONS,
+        get_embedding_model,
+    )
+
+    validated_role = validate_role(role)
+    if not isinstance(query, str):
+        raise TypeError("query must be a string.")
+    if not query.strip():
+        raise ValueError("query must not be empty or whitespace.")
+    if (
+        not isinstance(top_k, int)
+        or isinstance(top_k, bool)
+        or top_k <= 0
+    ):
+        raise ValueError("top_k must be a positive integer.")
+
+    embedder = embedding_model or get_embedding_model()
+    raw_vec = embedder.embed_query(query)
+    if not isinstance(raw_vec, list) or len(raw_vec) != EMBEDDING_DIMENSIONS:
+        raise RuntimeError(
+            f"Query embedding must have {EMBEDDING_DIMENSIONS} dimensions."
+        )
+    query_vec: list[float] = []
+    for val in raw_vec:
+        if not isinstance(val, (int, float)) or isinstance(val, bool):
+            raise RuntimeError("Query embedding contains non-numeric values.")
+        fval = float(val)
+        if not math.isfinite(fval):
+            raise RuntimeError("Query embedding contains non-finite values.")
+        query_vec.append(fval)
+    if all(v == 0.0 for v in query_vec):
+        raise RuntimeError("Query embedding must not be all zeros.")
+
+    rows = local_rag_store.match_pgvector_chunks(
+        query_embedding=query_vec,
+        requesting_role=validated_role,
+        match_count=top_k,
+    )
+
+    documents: list[Document] = []
+    for row in rows:
+        content = row.get("content")
+        if not isinstance(content, str) or not content.strip():
+            continue
+        meta = dict(row.get("metadata") or {})
+        meta["document_id"] = str(row.get("document_id"))
+        meta["section_id"] = str(row.get("section_id"))
+        meta["chunk_id"] = str(row.get("chunk_id"))
+        if row.get("page_number") is not None:
+            meta["page_number"] = row.get("page_number")
+        if row.get("similarity") is not None:
+            meta["relevance_score"] = float(row["similarity"])
+        documents.append(Document(page_content=content, metadata=meta))
+    return documents[:top_k]

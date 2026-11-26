@@ -11,7 +11,10 @@ from langchain_core.runnables import Runnable
 
 from src.chains.prompts import get_rag_prompt
 from src.llm.groq_model import get_groq_model
-from src.retrieval.retriever import retrieve_documents
+from src.retrieval.retriever import (
+    retrieve_documents,
+    retrieve_documents_pgvector,
+)
 from src.security.access_control import validate_role
 
 
@@ -176,12 +179,20 @@ def ask_question(
         raise ValueError("top_k must be a positive integer.")
 
     try:
-        documents = retrieve_documents(
-            question,
-            validated_role,
-            collections,
-            top_k=top_k,
-        )
+        if isinstance(collections, Mapping) and collections.get("backend") == "pgvector":
+            documents = retrieve_documents_pgvector(
+                question,
+                validated_role,
+                embedding_model=collections.get("embedding_model"),
+                top_k=top_k,
+            )
+        else:
+            documents = retrieve_documents(
+                question,
+                validated_role,
+                collections,
+                top_k=top_k,
+            )
     except Exception as exc:
         raise RuntimeError("Secure document retrieval failed.") from exc
 

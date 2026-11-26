@@ -34,6 +34,11 @@ router = APIRouter(prefix="/api/v1")
 
 MAX_UPLOAD_BYTES = 10 * 1024 * 1024  # 10 MiB
 _STREAM_CHUNK_BYTES = 256 * 1024
+_CONTENT_TYPES = {
+    ".pdf": "application/pdf",
+    ".docx": "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ".txt": "text/plain",
+}
 
 
 def require_admin(
@@ -235,6 +240,20 @@ async def ingest_upload(
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
                 detail="Document registry service is temporarily unavailable.",
+            ) from None
+
+        try:
+            local_rag_store.upload_source_file(
+                classified["file_hash_sha256"],
+                classified["filename"],
+                temp_path,
+                content_type=_CONTENT_TYPES.get(extension, "application/octet-stream"),
+            )
+        except local_rag_store.LocalRagStoreError:
+            logger.warning("Supabase Storage upload failed during /ingest.")
+            raise HTTPException(
+                status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+                detail="Document storage service is temporarily unavailable.",
             ) from None
 
         response.status_code = status.HTTP_201_CREATED

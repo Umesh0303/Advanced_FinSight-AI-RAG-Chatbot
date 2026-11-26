@@ -61,23 +61,14 @@ def _configured_cors_origins() -> list[str]:
 
 
 def initialize_api_resources() -> dict[str, Any]:
-    """Initialize the configured embeddings and existing persistent collections."""
+    """Initialize the configured embeddings for Supabase pgvector retrieval."""
 
     settings.validate_api_configuration()
     embedding_model = get_embedding_model()
-    collections = initialize_collections(embedding_model=embedding_model)
-    try:
-        summaries = sync_approved_documents_if_empty(collections)
-        if summaries:
-            logger.info(
-                "Synced %d approved document(s) into empty vector collections.",
-                len(summaries),
-            )
-    except Exception:
-        logger.exception(
-            "Startup approved-document sync failed; vectorstore collections remain empty."
-        )
-    return collections
+    return {
+        "backend": "pgvector",
+        "embedding_model": embedding_model,
+    }
 
 
 def create_app(

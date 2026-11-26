@@ -4,7 +4,9 @@ import hashlib
 import hmac
 import json
 import math
+import os
 import re
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping
@@ -1145,27 +1147,54 @@ def sync_approved_documents_if_empty(
             candidate.relative_to(target_dir.resolve())
         except ValueError:
             continue
-        if not candidate.is_file():
-            continue
-        if doc.get("indexing_status") == "indexed":
-            summaries.append(
-                rehydrate_indexed_document(
-                    candidate,
-                    str(doc["id"]),
-                    doc=doc,
-                    collections=collections,
-                    logical_filename=filename,
+
+        temp_path: Path | None = None
+        try:
+            if candidate.is_file():
+                source_path = candidate
+            else:
+                suffix = Path(filename).suffix.lower() or ".txt"
+                fd, raw_temp = tempfile.mkstemp(
+                    dir=str(target_dir),
+                    prefix=".sync_",
+                    suffix=suffix,
                 )
-            )
-        else:
-            summaries.append(
-                index_approved_document(
-                    candidate,
-                    str(doc["id"]),
-                    collections=collections,
-                    logical_filename=filename,
+                os.close(fd)
+                temp_path = Path(raw_temp)
+                file_hash = str(doc.get("file_hash_sha256") or "")
+                if not file_hash or not local_rag_store.download_source_file(
+                    file_hash,
+                    filename,
+                    temp_path,
+                ):
+                    continue
+                source_path = temp_path
+
+            if doc.get("indexing_status") == "indexed":
+                summaries.append(
+                    rehydrate_indexed_document(
+                        source_path,
+                        str(doc["id"]),
+                        doc=doc,
+                        collections=collections,
+                        logical_filename=filename,
+                    )
                 )
-            )
+            else:
+                summaries.append(
+                    index_approved_document(
+                        source_path,
+                        str(doc["id"]),
+                        collections=collections,
+                        logical_filename=filename,
+                    )
+                )
+        finally:
+            if temp_path is not None and temp_path.exists():
+                try:
+                    temp_path.unlink()
+                except OSError:
+                    pass
     return summaries
 
 
@@ -1591,6 +1620,243 @@ def index_approved_document(
             "indexing_status": updated_doc.get("indexing_status"),
             "approval_version": updated_doc.get("approval_version"),
             "verified_chunk_count": total_verified_chunks,
+            "verified_collections": sorted(verified_collections),
+        }
+    except Exception as exc:
+        try:
+            local_rag_store.fail_indexing(
+                document_id=document_id,
+                expected_approval_version=approval_version,
+                expected_file_hash=actual_hash,
+                error_details={"error_type": type(exc).__name__},
+                actor_id=actor_id,
+            )
+        except Exception:
+            pass
+        raise
+
+
+def _validate_embedding_vector(vector: Any, expected_dim: int) -> list[float]:
+    if not isinstance(vector, list) or len(vector) != expected_dim:
+        raise RuntimeError(
+            f"Embedding vector must have {expected_dim} dimensions."
+        )
+    validated: list[float] = []
+    for val in vector:
+        if not isinstance(val, (int, float)) or isinstance(val, bool):
+            raise RuntimeError("Embedding vector contains non-numeric values.")
+        fval = float(val)
+        if not math.isfinite(fval):
+            raise RuntimeError("Embedding vector contains non-finite values.")
+        validated.append(fval)
+    if all(v == 0.0 for v in validated):
+        raise RuntimeError("Embedding vector must not be all zeros.")
+    return validated
+
+
+def index_approved_document_pgvector(
+    document_path: Path,
+    document_id: str,
+    *,
+    embedding_model: Any | None = None,
+    actor_id: str | None = None,
+    logical_filename: str | None = None,
+) -> dict[str, Any]:
+    """Embed approved sections with Gemini and store in Supabase pgvector."""
+
+    from src.api.services import local_rag_store
+    from src.embeddings.embedding_model import (
+        EMBEDDING_DIMENSIONS,
+        get_embedding_model,
+    )
+
+    if not isinstance(document_path, Path):
+        raise TypeError("document_path must be a pathlib.Path")
+
+    resolved_path = document_path.resolve(strict=True)
+    doc = local_rag_store.get_document_by_id(document_id)
+    if doc is None:
+        raise RuntimeError(f"Document {document_id} not found in Supabase.")
+    if doc.get("approval_status") != "approved":
+        raise RuntimeError(
+            f"Document {document_id} is not approved for indexing "
+            f"(status: {doc.get('approval_status')})."
+        )
+
+    file_hash = hashlib.sha256()
+    with resolved_path.open("rb") as document_file:
+        for file_chunk in iter(lambda: document_file.read(1024 * 1024), b""):
+            file_hash.update(file_chunk)
+    actual_hash = file_hash.hexdigest().lower()
+    if actual_hash != doc.get("file_hash_sha256"):
+        raise RuntimeError(
+            "Document file hash does not match the approved Supabase record."
+        )
+
+    approval_version = int(doc["approval_version"])
+    source_id = str(doc["source_id"])
+    source_name = (
+        Path(logical_filename).name
+        if logical_filename and logical_filename.strip()
+        else str(doc.get("filename") or resolved_path.name)
+    )
+
+    local_rag_store.start_indexing(
+        document_id=document_id,
+        expected_approval_version=approval_version,
+        expected_file_hash=actual_hash,
+        actor_id=actor_id,
+    )
+
+    try:
+        loaded_documents = load_document(resolved_path)
+        parsed_sections, _, page_boundaries = _identify_sections(
+            loaded_documents,
+            source_name,
+        )
+        db_sections = local_rag_store.get_document_sections(document_id)
+        approved_sections = [
+            sec for sec in db_sections if sec.get("review_status") == "approved"
+        ]
+        if not approved_sections:
+            raise RuntimeError("No approved sections exist to index.")
+
+        chunk_records: list[dict[str, Any]] = []
+        chunk_texts: list[str] = []
+        section_role_chunks: dict[str, dict[str, list[str]]] = {}
+        verified_collections: set[str] = set()
+
+        for db_sec in approved_sections:
+            sec_index = int(db_sec["section_index"])
+            if sec_index < 0 or sec_index >= len(parsed_sections):
+                raise RuntimeError(
+                    f"Approved section index {sec_index} is missing from document."
+                )
+            parsed_sec = parsed_sections[sec_index]
+            parsed_hash = hashlib.sha256(
+                parsed_sec["text"].encode("utf-8")
+            ).hexdigest().lower()
+            if parsed_hash != db_sec.get("section_sha256"):
+                raise RuntimeError(
+                    f"Section {sec_index} content hash mismatch against approved record."
+                )
+
+            approved_roles = list(db_sec.get("approved_roles") or [])
+            if not approved_roles:
+                raise RuntimeError(
+                    f"Approved section {sec_index} has no approved_roles."
+                )
+
+            classification = ClassificationResult(
+                section_title=str(db_sec["section_title"]),
+                section_text=parsed_sec["text"],
+                allowed_roles=approved_roles,
+                classification_method=str(
+                    db_sec.get("classification_method") or "groq_llm"
+                ),
+                classification_confidence=float(
+                    db_sec.get("classification_confidence")
+                    if db_sec.get("classification_confidence") is not None
+                    else 1.0
+                ),
+                review_required=False,
+            )
+            split_chunks = split_classified_section(classification)
+            section_uuid = str(db_sec["id"])
+            role_map: dict[str, list[str]] = {role: [] for role in approved_roles}
+
+            for chunk_idx, chunk in enumerate(split_chunks):
+                chunk_id = _chunk_id(document_id, sec_index, chunk_idx)
+                start_offset = parsed_sec["start_offset"] + int(
+                    chunk.metadata.get("start_index", 0)
+                )
+                page_number = _page_number_at_offset(
+                    start_offset,
+                    page_boundaries,
+                )
+                chunk_records.append({
+                    "section_id": section_uuid,
+                    "chunk_id": chunk_id,
+                    "chunk_index": chunk_idx,
+                    "page_number": page_number,
+                    "content": chunk.page_content,
+                    "metadata": {
+                        "document_id": document_id,
+                        "section_id": section_uuid,
+                        "source_id": source_id,
+                        "chunk_id": chunk_id,
+                        "source": source_name,
+                        "page_number": page_number,
+                        "section_title": str(db_sec["section_title"]),
+                        "allowed_roles": approved_roles,
+                        "classification_method": classification.classification_method,
+                        "classification_confidence": classification.classification_confidence,
+                    },
+                })
+                chunk_texts.append(chunk.page_content)
+                for role in approved_roles:
+                    role_map[role].append(chunk_id)
+                    verified_collections.add(role)
+
+            section_role_chunks[section_uuid] = role_map
+
+        embedder = embedding_model or get_embedding_model()
+        raw_vectors = embedder.embed_documents(chunk_texts)
+        if not isinstance(raw_vectors, list) or len(raw_vectors) != len(chunk_records):
+            raise RuntimeError(
+                "Embedding model returned a mismatched number of vectors."
+            )
+
+        for record, raw_vec in zip(chunk_records, raw_vectors):
+            vec = _validate_embedding_vector(raw_vec, EMBEDDING_DIMENSIONS)
+            record["embedding"] = "[" + ",".join(repr(x) for x in vec) + "]"
+
+        upsert_res = local_rag_store.upsert_pgvector_chunks(
+            document_id=document_id,
+            expected_approval_version=approval_version,
+            expected_file_hash=actual_hash,
+            chunks=chunk_records,
+            actor_id=actor_id,
+        )
+        stored_count = local_rag_store.count_pgvector_chunks(document_id)
+        if stored_count != len(chunk_records) or int(upsert_res.get("inserted_count", 0)) != len(chunk_records):
+            raise RuntimeError(
+                f"Supabase pgvector verification mismatch: expected {len(chunk_records)}, stored {stored_count}."
+            )
+
+        section_chunks_payload = [
+            {
+                "section_id": sec_uuid,
+                "chunk_ids_by_role": role_map,
+            }
+            for sec_uuid, role_map in section_role_chunks.items()
+        ]
+        total_attested_chunks = sum(
+            len(ids)
+            for role_map in section_role_chunks.values()
+            for ids in role_map.values()
+        )
+
+        updated_doc = local_rag_store.complete_indexing(
+            document_id=document_id,
+            expected_approval_version=approval_version,
+            expected_file_hash=actual_hash,
+            section_chunks=section_chunks_payload,
+            details={
+                "verified_chunk_count": total_attested_chunks,
+                "pgvector_rows_stored": stored_count,
+                "verified_at": datetime.now(timezone.utc).isoformat(),
+                "verification_source": "supabase_pgvector_backend_attestation",
+                "verified_collections": sorted(verified_collections),
+            },
+            actor_id=actor_id,
+        )
+        return {
+            "document_id": document_id,
+            "approval_status": updated_doc.get("approval_status"),
+            "indexing_status": updated_doc.get("indexing_status"),
+            "approval_version": updated_doc.get("approval_version"),
+            "verified_chunk_count": stored_count,
             "verified_collections": sorted(verified_collections),
         }
     except Exception as exc:

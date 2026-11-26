@@ -635,17 +635,15 @@ def test_ingest_uploads_if_empty_ingests_supported_files(tmp_path, monkeypatch):
     assert summaries == [{"document_id": "a_notes.txt"}, {"document_id": "b_manual.pdf"}]
 
 
-def test_initialize_api_resources_continues_if_startup_ingestion_fails(monkeypatch):
+def test_initialize_api_resources_returns_pgvector_backend(monkeypatch):
     import src.api.main as api_main
 
-    fake_collections = {"admin": object()}
+    fake_embedder = object()
     monkeypatch.setattr(api_main.settings, "validate_api_configuration", lambda: None)
-    monkeypatch.setattr(api_main, "get_embedding_model", lambda: object())
-    monkeypatch.setattr(api_main, "initialize_collections", lambda embedding_model: fake_collections)
-    monkeypatch.setattr(
-        api_main,
-        "sync_approved_documents_if_empty",
-        lambda collections: (_ for _ in ()).throw(RuntimeError("missing hmac key")),
-    )
+    monkeypatch.setattr(api_main, "get_embedding_model", lambda: fake_embedder)
 
-    assert api_main.initialize_api_resources() is fake_collections
+    resources = api_main.initialize_api_resources()
+    assert resources == {
+        "backend": "pgvector",
+        "embedding_model": fake_embedder,
+    }

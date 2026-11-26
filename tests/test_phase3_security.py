@@ -319,13 +319,14 @@ def test_admin_document_endpoints_enforce_admin_and_workflow(monkeypatch):
             "reject_or_revoke_document",
             lambda **kw: {"id": doc_id, "approval_status": "revoked", "indexing_status": "stale"},
         )
+        monkeypatch.setattr(store, "delete_pgvector_chunks", lambda did: 2)
         revoke_resp = client.post(
             f"/api/v1/documents/{doc_id}/revoke",
             headers=bearer(make_token(admin_key)),
             json={"decision_reason": "Outdated policy"},
         )
         assert revoke_resp.status_code == 200
-        assert revoke_resp.json()["removed_chunks"] == 1
+        assert revoke_resp.json()["removed_chunks"] == 3
         assert collections["customer"].stored == {}
 
 
@@ -390,3 +391,191 @@ def test_sync_approved_documents_rehydrates_already_indexed_doc(tmp_path, monkey
     assert len(summaries) == 1
     assert summaries[0]["indexing_status"] == "indexed"
     assert len(collections["customer"].stored) == 1
+
+
+def test_sync_approved_documents_downloads_from_supabase_storage(tmp_path, monkeypatch):
+    uploads = tmp_path / "uploads"
+    uploads.mkdir()
+    sec0_text = "1. Public Section\nCustomer may read this."
+    raw_bytes = sec0_text.encode("utf-8")
+
+    monkeypatch.setattr("src.ingestion.document_loader.UPLOADS_DIR", uploads)
+
+    file_hash = hashlib.sha256(raw_bytes).hexdigest().lower()
+    sec0_hash = hashlib.sha256(raw_bytes).hexdigest().lower()
+    doc_id = str(uuid4())
+    sec0_id = str(uuid4())
+
+    monkeypatch.setattr(
+        ingest_module,
+        "load_document",
+        lambda path: [Document(page_content=sec0_text, metadata={"page": 0})],
+    )
+    monkeypatch.setattr(
+        store,
+        "list_documents",
+        lambda limit=500: [
+            {
+                "id": doc_id,
+                "file_hash_sha256": file_hash,
+                "source_id": "s" * 64,
+                "filename": "remote_only.txt",
+                "approval_status": "approved",
+                "indexing_status": "indexed",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        store,
+        "get_document_sections",
+        lambda did: [
+            {
+                "id": sec0_id,
+                "section_index": 0,
+                "section_title": "1. Public Section",
+                "section_sha256": sec0_hash,
+                "review_status": "approved",
+                "approved_roles": ["customer"],
+            }
+        ],
+    )
+
+    def fake_download(fh, fname, dest):
+        assert fh == file_hash
+        assert fname == "remote_only.txt"
+        dest.write_bytes(raw_bytes)
+        return True
+
+    monkeypatch.setattr(store, "download_source_file", fake_download)
+
+    collections = {role: MockChromaCollection() for role in ROLES}
+    summaries = ingest_module.sync_approved_documents_if_empty(
+        collections,
+        uploads_dir=uploads,
+    )
+    assert len(summaries) == 1
+    assert summaries[0]["indexing_status"] == "indexed"
+    assert len(collections["customer"].stored) == 1
+    assert list(uploads.iterdir()) == []
+
+
+def test_index_approved_document_pgvector_and_retrieve(tmp_path, monkeypatch):
+    from src.chains.rag_chain import ask_question
+    from src.retrieval.retriever import retrieve_documents_pgvector
+
+    uploads = tmp_path / "uploads"
+    uploads.mkdir()
+    doc_file = uploads / "policy.txt"
+    sec0_text = "1. Public Section\nCustomer may read this."
+    doc_file.write_text(sec0_text, encoding="utf-8")
+
+    monkeypatch.setattr("src.ingestion.document_loader.UPLOADS_DIR", uploads)
+
+    file_hash = hashlib.sha256(doc_file.read_bytes()).hexdigest().lower()
+    sec0_hash = hashlib.sha256(sec0_text.encode("utf-8")).hexdigest().lower()
+    doc_id = str(uuid4())
+    sec0_id = str(uuid4())
+    actor_id = str(uuid4())
+
+    monkeypatch.setattr(
+        ingest_module,
+        "load_document",
+        lambda path: [Document(page_content=sec0_text, metadata={"page": 0})],
+    )
+    monkeypatch.setattr(
+        store,
+        "get_document_by_id",
+        lambda did: {
+            "id": doc_id,
+            "file_hash_sha256": file_hash,
+            "source_id": "s" * 64,
+            "filename": "policy.txt",
+            "approval_status": "approved",
+            "approval_version": 2,
+        },
+    )
+    monkeypatch.setattr(
+        store,
+        "get_document_sections",
+        lambda did: [
+            {
+                "id": sec0_id,
+                "section_index": 0,
+                "section_title": "1. Public Section",
+                "section_sha256": sec0_hash,
+                "review_status": "approved",
+                "approved_roles": ["customer"],
+            }
+        ],
+    )
+
+    events = []
+    monkeypatch.setattr(
+        store,
+        "start_indexing",
+        lambda **kw: events.append("start") or {"id": doc_id},
+    )
+    monkeypatch.setattr(
+        store,
+        "upsert_pgvector_chunks",
+        lambda **kw: events.append(("upsert", len(kw["chunks"])))
+        or {"document_id": doc_id, "inserted_count": len(kw["chunks"])},
+    )
+    monkeypatch.setattr(store, "count_pgvector_chunks", lambda did: 1)
+    monkeypatch.setattr(
+        store,
+        "complete_indexing",
+        lambda **kw: events.append("complete")
+        or {"id": doc_id, "approval_status": "approved", "indexing_status": "indexed", "approval_version": 2},
+    )
+
+    class FakeEmbedder:
+        def embed_documents(self, texts):
+            return [[0.1] * 768 for _ in texts]
+
+        def embed_query(self, query):
+            return [0.1] * 768
+
+    summary = ingest_module.index_approved_document_pgvector(
+        doc_file,
+        doc_id,
+        embedding_model=FakeEmbedder(),
+        actor_id=actor_id,
+    )
+    assert summary["indexing_status"] == "indexed"
+    assert summary["verified_chunk_count"] == 1
+    assert events == ["start", ("upsert", 1), "complete"]
+
+    monkeypatch.setattr(
+        store,
+        "match_pgvector_chunks",
+        lambda **kw: [
+            {
+                "id": str(uuid4()),
+                "document_id": doc_id,
+                "section_id": sec0_id,
+                "chunk_id": "chunk-0",
+                "chunk_index": 0,
+                "page_number": 1,
+                "content": sec0_text,
+                "metadata": {"source": "policy.txt", "section_title": "1. Public Section"},
+                "similarity": 0.92,
+            }
+        ],
+    )
+    docs = retrieve_documents_pgvector("policy", "customer", embedding_model=FakeEmbedder())
+    assert len(docs) == 1
+    assert docs[0].metadata["document_id"] == doc_id
+
+    class FakeLLM:
+        def invoke(self, prompt_value):
+            return "Grounded pgvector answer."
+
+    rag_resp = ask_question(
+        "What is the policy?",
+        "customer",
+        {"backend": "pgvector", "embedding_model": FakeEmbedder()},
+        llm=FakeLLM(),
+    )
+    assert rag_resp.answer == "Grounded pgvector answer."
+    assert rag_resp.retrieved_count == 1

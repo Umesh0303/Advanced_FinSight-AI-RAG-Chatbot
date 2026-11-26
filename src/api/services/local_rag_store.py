@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 from typing import Any
+from urllib.parse import quote
 from uuid import UUID
 
 import httpx
@@ -70,10 +72,10 @@ def _normalize_uuid(value: object, field_name: str) -> str:
         raise ValueError(f"{field_name} must be a valid UUID.") from exc
 
 
-def _call_rpc(
+def _call_rpc_raw(
     rpc_name: str,
     payload: Mapping[str, Any],
-) -> dict[str, Any]:
+) -> Any:
     base_url, headers = _supabase_headers_and_base()
     endpoint = f"{base_url}/rest/v1/rpc/{rpc_name}"
     try:
@@ -99,12 +101,18 @@ def _call_rpc(
         )
 
     try:
-        data = response.json()
+        return response.json()
     except ValueError as exc:
         raise LocalRagStoreUnavailable(
             f"Supabase RPC '{rpc_name}' returned invalid JSON."
         ) from exc
 
+
+def _call_rpc(
+    rpc_name: str,
+    payload: Mapping[str, Any],
+) -> dict[str, Any]:
+    data = _call_rpc_raw(rpc_name, payload)
     if not isinstance(data, Mapping):
         raise LocalRagStoreUnavailable(
             f"Supabase RPC '{rpc_name}' returned an unexpected payload."
@@ -468,3 +476,176 @@ def verify_chunks_for_retrieval(
         authorized.add((doc_id, sec_id))
 
     return authorized
+
+
+def storage_object_path(file_hash_sha256: str, filename: str) -> str:
+    """Build a canonical, traversal-safe Supabase Storage object path."""
+
+    clean_hash = file_hash_sha256.strip().lower()
+    clean_name = Path(filename).name.strip()
+    return f"{clean_hash}/{clean_name}"
+
+
+def upload_source_file(
+    file_hash_sha256: str,
+    filename: str,
+    file_path: Path,
+    content_type: str = "application/octet-stream",
+) -> str:
+    """Upload a validated source document to the private Supabase Storage bucket."""
+
+    base_url, headers = _supabase_headers_and_base()
+    bucket = settings.SUPABASE_STORAGE_BUCKET
+    object_path = storage_object_path(file_hash_sha256, filename)
+    encoded_path = quote(object_path, safe="/")
+    endpoint = f"{base_url}/storage/v1/object/{bucket}/{encoded_path}"
+
+    upload_headers = {
+        "apikey": headers["apikey"],
+        "Authorization": headers["Authorization"],
+        "Content-Type": content_type,
+        "x-upsert": "true",
+    }
+    try:
+        data = file_path.read_bytes()
+        response = httpx.post(
+            endpoint,
+            content=data,
+            headers=upload_headers,
+            timeout=30.0,
+            follow_redirects=False,
+        )
+    except (OSError, httpx.RequestError) as exc:
+        raise LocalRagStoreUnavailable(
+            "Failed to upload source document to Supabase Storage."
+        ) from exc
+
+    if response.status_code not in {200, 201}:
+        raise LocalRagStoreUnavailable(
+            f"Supabase Storage upload failed with HTTP {response.status_code}."
+        )
+    return object_path
+
+
+def download_source_file(
+    file_hash_sha256: str,
+    filename: str,
+    dest_path: Path,
+) -> bool:
+    """Download a source document from Supabase Storage; return False if not found."""
+
+    base_url, headers = _supabase_headers_and_base()
+    bucket = settings.SUPABASE_STORAGE_BUCKET
+    object_path = storage_object_path(file_hash_sha256, filename)
+    encoded_path = quote(object_path, safe="/")
+    endpoint = f"{base_url}/storage/v1/object/{bucket}/{encoded_path}"
+
+    download_headers = {
+        "apikey": headers["apikey"],
+        "Authorization": headers["Authorization"],
+    }
+    try:
+        response = httpx.get(
+            endpoint,
+            headers=download_headers,
+            timeout=30.0,
+            follow_redirects=False,
+        )
+    except httpx.RequestError as exc:
+        raise LocalRagStoreUnavailable(
+            "Failed to download source document from Supabase Storage."
+        ) from exc
+
+    if response.status_code == 404:
+        return False
+    if response.status_code != 200:
+        raise LocalRagStoreUnavailable(
+            f"Supabase Storage download failed with HTTP {response.status_code}."
+        )
+
+    dest_path.write_bytes(response.content)
+    return True
+
+
+def _format_pgvector(vector: Sequence[float]) -> str:
+    return "[" + ",".join(repr(float(x)) for x in vector) + "]"
+
+
+def upsert_pgvector_chunks(
+    *,
+    document_id: str,
+    expected_approval_version: int,
+    expected_file_hash: str,
+    chunks: Sequence[Mapping[str, Any]],
+    actor_id: str | None = None,
+) -> dict[str, Any]:
+    """Store embedded chunks in Supabase pgvector (local_rag_chunks)."""
+
+    return _call_rpc(
+        "local_rag_upsert_pgvector_chunks",
+        {
+            "p_document_id": _normalize_uuid(document_id, "document_id"),
+            "p_expected_approval_version": expected_approval_version,
+            "p_expected_file_hash": expected_file_hash.strip().lower(),
+            "p_chunks": [dict(c) for c in chunks],
+            "p_actor_id": (
+                _normalize_uuid(actor_id, "actor_id")
+                if actor_id is not None
+                else None
+            ),
+        },
+    )
+
+
+def delete_pgvector_chunks(document_id: str) -> int:
+    """Delete all pgvector chunks for one document_id."""
+
+    res = _call_rpc_raw(
+        "local_rag_delete_pgvector_chunks",
+        {"p_document_id": _normalize_uuid(document_id, "document_id")},
+    )
+    if not isinstance(res, int) or isinstance(res, bool):
+        raise LocalRagStoreUnavailable("Invalid response from pgvector chunk cleanup.")
+    return res
+
+
+def count_pgvector_chunks(document_id: str) -> int:
+    """Return the number of stored pgvector chunks for one document_id."""
+
+    normalized_id = _normalize_uuid(document_id, "document_id")
+    rows = _select_rows(
+        "local_rag_chunks",
+        {
+            "select": "id",
+            "document_id": f"eq.{normalized_id}",
+        },
+    )
+    return len(rows)
+
+
+def match_pgvector_chunks(
+    *,
+    query_embedding: Sequence[float],
+    requesting_role: str,
+    match_count: int = 5,
+    match_threshold: float = 0.0,
+) -> list[dict[str, Any]]:
+    """Query Supabase match_local_rag_chunks RPC with role & approval enforcement."""
+
+    from src.security.access_control import validate_role
+
+    validated_role = validate_role(requesting_role)
+    rows = _call_rpc_raw(
+        "match_local_rag_chunks",
+        {
+            "query_embedding": _format_pgvector(query_embedding),
+            "requesting_role": validated_role,
+            "match_count": match_count,
+            "match_threshold": match_threshold,
+        },
+    )
+    if not isinstance(rows, list) or any(not isinstance(r, Mapping) for r in rows):
+        raise LocalRagStoreUnavailable(
+            "match_local_rag_chunks returned malformed results."
+        )
+    return [dict(r) for r in rows]

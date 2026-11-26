@@ -33,6 +33,9 @@ services:
       - key: SUPABASE_JWT_AUDIENCE
         value: authenticated
 
+      - key: SUPABASE_STORAGE_BUCKET
+        value: local-rag-documents
+
       - key: API_CORS_ORIGINS
         value: https://finsight-ai-1054.ai.studio,https://ais-dev-dfpxvum2dlpi4753mzterk-965437435161.asia-east1.run.app
 

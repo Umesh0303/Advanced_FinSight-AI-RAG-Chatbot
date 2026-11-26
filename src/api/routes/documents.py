@@ -28,7 +28,7 @@ from src.api.schemas.documents import (
 from src.api.services import local_rag_store
 from src.config.settings import UPLOADS_DIR
 from src.ingestion.ingest import (
-    index_approved_document,
+    index_approved_document_pgvector,
     remove_document_chunks_from_chroma,
 )
 
@@ -167,10 +167,16 @@ def revoke_document(
         raise _handle_store_error(exc) from None
 
     removed_chunks = 0
+    try:
+        removed_chunks = local_rag_store.delete_pgvector_chunks(document_id)
+    except Exception:
+        logger.warning(
+            "pgvector cleanup failed after revocation; Supabase revocation still blocks retrieval."
+        )
     collections = getattr(request.app.state, "collections", None)
-    if isinstance(collections, Mapping):
+    if isinstance(collections, Mapping) and collections.get("backend") != "pgvector":
         try:
-            removed_chunks = remove_document_chunks_from_chroma(
+            removed_chunks += remove_document_chunks_from_chroma(
                 document_id,
                 collections,
             )
@@ -256,17 +262,40 @@ async def index_document_endpoint(
                     detail="Invalid stored filename.",
                 ) from None
             if not candidate.is_file():
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Source file is not present on disk; upload it with this request.",
+                suffix = Path(candidate.name).suffix.lower() or ".txt"
+                UPLOADS_DIR.mkdir(parents=True, exist_ok=True)
+                fd, raw_temp = tempfile.mkstemp(
+                    dir=str(UPLOADS_DIR),
+                    prefix=".storage_",
+                    suffix=suffix,
                 )
-            target_path = candidate
-            logical_name = candidate.name
+                os.close(fd)
+                temp_path = Path(raw_temp)
+                downloaded = local_rag_store.download_source_file(
+                    str(doc["file_hash_sha256"]),
+                    candidate.name,
+                    temp_path,
+                )
+                if not downloaded:
+                    raise HTTPException(
+                        status_code=status.HTTP_400_BAD_REQUEST,
+                        detail="Source file is not present on disk or in storage; upload it with this request.",
+                    )
+                target_path = temp_path
+                logical_name = candidate.name
+            else:
+                target_path = candidate
+                logical_name = candidate.name
 
-        summary = index_approved_document(
+        embedding_model = (
+            collections.get("embedding_model")
+            if isinstance(collections, Mapping)
+            else None
+        )
+        summary = index_approved_document_pgvector(
             target_path,
             document_id,
-            collections=collections,
+            embedding_model=embedding_model,
             actor_id=principal.user_id,
             logical_filename=logical_name,
         )

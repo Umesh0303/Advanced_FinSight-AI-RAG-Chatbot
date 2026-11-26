@@ -124,4 +124,4 @@ def test_api_and_ingestion_use_configured_chroma_path(
     result = ingest_module.ingest_document(document)
 
     assert result["duplicate"] is True
-    assert initialized_paths == [configured_path] * 8
+    assert initialized_paths == [configured_path] * 4

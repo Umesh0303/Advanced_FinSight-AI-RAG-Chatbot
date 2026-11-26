@@ -30,6 +30,9 @@ SUPABASE_JWT_AUDIENCE: Final[str] = os.getenv(
     "SUPABASE_JWT_AUDIENCE",
     "authenticated",
 )
+SUPABASE_STORAGE_BUCKET: Final[str] = (
+    os.getenv("SUPABASE_STORAGE_BUCKET") or "local-rag-documents"
+).strip()
 API_CORS_ORIGINS: Final[str] = os.getenv("API_CORS_ORIGINS", "")
 
 # Project data and storage paths.

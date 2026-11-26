@@ -86,6 +86,11 @@ def test_ingest_admin_valid_txt_succeeds_and_cleans_temp_file(ingest_client, mon
 
     monkeypatch.setattr(store, "get_document_by_hash", lambda h: None)
     monkeypatch.setattr(
+        store,
+        "upload_source_file",
+        lambda file_hash, filename, path, content_type="application/octet-stream": f"{file_hash}/{filename}",
+    )
+    monkeypatch.setattr(
         ingest_route,
         "classify_document_sections",
         lambda path, logical_filename=None: _sample_classified(logical_filename),
@@ -128,6 +133,11 @@ def test_ingest_admin_valid_pdf_and_docx_magic_bytes(ingest_client, monkeypatch)
     private_key = configure_auth(monkeypatch, application_role="Admin")
 
     monkeypatch.setattr(store, "get_document_by_hash", lambda h: None)
+    monkeypatch.setattr(
+        store,
+        "upload_source_file",
+        lambda file_hash, filename, path, content_type="application/octet-stream": f"{file_hash}/{filename}",
+    )
     monkeypatch.setattr(
         ingest_route,
         "classify_document_sections",
@@ -262,6 +272,11 @@ def test_ingest_extraction_and_supabase_failures(ingest_client, monkeypatch):
 
     monkeypatch.setattr(store, "get_document_by_hash", lambda h: None)
     monkeypatch.setattr(
+        store,
+        "upload_source_file",
+        lambda file_hash, filename, path, content_type="application/octet-stream": f"{file_hash}/{filename}",
+    )
+    monkeypatch.setattr(
         ingest_route,
         "classify_document_sections",
         lambda path, logical_filename=None: (_ for _ in ()).throw(ValueError("corrupt")),
@@ -322,3 +337,42 @@ def test_local_rag_store_rpc_and_error_handling(monkeypatch):
     monkeypatch.setattr(store.httpx, "get", raise_timeout)
     with pytest.raises(store.LocalRagStoreUnavailable):
         store.get_document_by_hash("a" * 64)
+
+
+def test_ingest_storage_upload_failure_returns_503(ingest_client, monkeypatch):
+    client, uploads_dir = ingest_client
+    private_key = configure_auth(monkeypatch, application_role="Admin")
+
+    monkeypatch.setattr(store, "get_document_by_hash", lambda h: None)
+    monkeypatch.setattr(
+        ingest_route,
+        "classify_document_sections",
+        lambda path, logical_filename=None: _sample_classified(logical_filename),
+    )
+    monkeypatch.setattr(
+        store,
+        "register_document",
+        lambda **kwargs: {
+            "id": str(uuid4()),
+            "filename": kwargs["filename"],
+            "file_hash_sha256": kwargs["file_hash_sha256"],
+            "approval_status": "pending",
+            "indexing_status": "not_indexed",
+            "approval_version": 1,
+        },
+    )
+    monkeypatch.setattr(
+        store,
+        "upload_source_file",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            store.LocalRagStoreUnavailable("storage down")
+        ),
+    )
+
+    response = client.post(
+        "/api/v1/ingest",
+        headers=bearer(make_token(private_key)),
+        files={"file": ("policy.txt", b"Customer policy text.", "text/plain")},
+    )
+    assert response.status_code == 503
+    assert list(uploads_dir.iterdir()) == []
