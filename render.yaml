@@ -34,7 +34,7 @@ services:
         value: authenticated
 
       - key: API_CORS_ORIGINS
-        value: https://finsight-ai-1054.ai.studio
+        value: https://finsight-ai-1054.ai.studio,https://ais-dev-dfpxvum2dlpi4753mzterk-965437435161.asia-east1.run.app
 
       - key: CHROMA_DB_DIR
         value: /tmp/finsight_chroma_db
