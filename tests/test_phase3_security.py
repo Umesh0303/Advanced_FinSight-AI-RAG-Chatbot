@@ -28,7 +28,7 @@ class MockChromaCollection:
     def similarity_search_with_relevance_scores(self, query, k):
         return self.docs_with_scores[:k]
 
-    def get(self, ids=None, where=None, include=None):
+    def get(self, ids=None, where=None, include=None, limit=None):
         matching = list(self.stored)
         if ids is not None:
             matching = [cid for cid in matching if cid in ids]
@@ -41,6 +41,8 @@ class MockChromaCollection:
                     for k, v in where.items()
                 )
             ]
+        if limit is not None:
+            matching = matching[:limit]
         res = {"ids": matching}
         if include and "metadatas" in include:
             res["metadatas"] = [self.stored[cid].metadata for cid in matching]
@@ -325,3 +327,66 @@ def test_admin_document_endpoints_enforce_admin_and_workflow(monkeypatch):
         assert revoke_resp.status_code == 200
         assert revoke_resp.json()["removed_chunks"] == 1
         assert collections["customer"].stored == {}
+
+
+def test_sync_approved_documents_rehydrates_already_indexed_doc(tmp_path, monkeypatch):
+    uploads = tmp_path / "uploads"
+    uploads.mkdir()
+    doc_file = uploads / "policy.txt"
+    sec0_text = "1. Public Section\nCustomer may read this."
+    doc_file.write_text(sec0_text, encoding="utf-8")
+
+    monkeypatch.setattr("src.ingestion.document_loader.UPLOADS_DIR", uploads)
+
+    file_hash = hashlib.sha256(doc_file.read_bytes()).hexdigest().lower()
+    sec0_hash = hashlib.sha256(sec0_text.encode("utf-8")).hexdigest().lower()
+    doc_id = str(uuid4())
+    sec0_id = str(uuid4())
+
+    monkeypatch.setattr(
+        ingest_module,
+        "load_document",
+        lambda path: [Document(page_content=sec0_text, metadata={"page": 0})],
+    )
+    monkeypatch.setattr(
+        store,
+        "list_documents",
+        lambda limit=500: [
+            {
+                "id": doc_id,
+                "file_hash_sha256": file_hash,
+                "source_id": "s" * 64,
+                "filename": "policy.txt",
+                "approval_status": "approved",
+                "indexing_status": "indexed",
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        store,
+        "get_document_sections",
+        lambda did: [
+            {
+                "id": sec0_id,
+                "section_index": 0,
+                "section_title": "1. Public Section",
+                "section_sha256": sec0_hash,
+                "review_status": "approved",
+                "approved_roles": ["customer"],
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        store,
+        "start_indexing",
+        lambda **kw: (_ for _ in ()).throw(AssertionError("should not call start_indexing")),
+    )
+
+    collections = {role: MockChromaCollection() for role in ROLES}
+    summaries = ingest_module.sync_approved_documents_if_empty(
+        collections,
+        uploads_dir=uploads,
+    )
+    assert len(summaries) == 1
+    assert summaries[0]["indexing_status"] == "indexed"
+    assert len(collections["customer"].stored) == 1

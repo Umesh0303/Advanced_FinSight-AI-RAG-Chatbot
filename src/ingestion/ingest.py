@@ -1147,14 +1147,25 @@ def sync_approved_documents_if_empty(
             continue
         if not candidate.is_file():
             continue
-        summaries.append(
-            index_approved_document(
-                candidate,
-                str(doc["id"]),
-                collections=collections,
-                logical_filename=filename,
+        if doc.get("indexing_status") == "indexed":
+            summaries.append(
+                rehydrate_indexed_document(
+                    candidate,
+                    str(doc["id"]),
+                    doc=doc,
+                    collections=collections,
+                    logical_filename=filename,
+                )
             )
-        )
+        else:
+            summaries.append(
+                index_approved_document(
+                    candidate,
+                    str(doc["id"]),
+                    collections=collections,
+                    logical_filename=filename,
+                )
+            )
     return summaries
 
 
@@ -1275,6 +1286,225 @@ def remove_document_chunks_from_chroma(
     return removed
 
 
+def _write_approved_sections_to_chroma(
+    resolved_path: Path,
+    document_id: str,
+    source_id: str,
+    source_name: str,
+    target_collections: Mapping[str, Any],
+) -> tuple[list[dict[str, Any]], set[str], int]:
+    """Chunk, embed, write, and verify approved sections in ChromaDB."""
+
+    from src.api.services import local_rag_store
+
+    loaded_documents = load_document(resolved_path)
+    parsed_sections, _, page_boundaries = _identify_sections(
+        loaded_documents,
+        source_name,
+    )
+    db_sections = local_rag_store.get_document_sections(document_id)
+    approved_sections = [
+        sec for sec in db_sections if sec.get("review_status") == "approved"
+    ]
+    if not approved_sections:
+        raise RuntimeError("No approved sections exist to index.")
+
+    section_chunks_payload: list[dict[str, Any]] = []
+    verified_collections: set[str] = set()
+    total_verified_chunks = 0
+
+    for db_sec in approved_sections:
+        sec_index = int(db_sec["section_index"])
+        if sec_index < 0 or sec_index >= len(parsed_sections):
+            raise RuntimeError(
+                f"Approved section index {sec_index} is missing from document."
+            )
+        parsed_sec = parsed_sections[sec_index]
+        parsed_hash = hashlib.sha256(
+            parsed_sec["text"].encode("utf-8")
+        ).hexdigest().lower()
+        if parsed_hash != db_sec.get("section_sha256"):
+            raise RuntimeError(
+                f"Section {sec_index} content hash mismatch against approved record."
+            )
+
+        approved_roles = list(db_sec.get("approved_roles") or [])
+        if not approved_roles:
+            raise RuntimeError(
+                f"Approved section {sec_index} has no approved_roles."
+            )
+
+        classification = ClassificationResult(
+            section_title=str(db_sec["section_title"]),
+            section_text=parsed_sec["text"],
+            allowed_roles=approved_roles,
+            classification_method=str(
+                db_sec.get("classification_method") or "groq_llm"
+            ),
+            classification_confidence=float(
+                db_sec.get("classification_confidence")
+                if db_sec.get("classification_confidence") is not None
+                else 1.0
+            ),
+            review_required=False,
+        )
+        split_chunks = split_classified_section(classification)
+        section_uuid = str(db_sec["id"])
+        chunk_ids_by_role: dict[str, list[str]] = {}
+
+        for role in approved_roles:
+            collection = target_collections[role]
+            role_docs: list[Document] = []
+            role_ids: list[str] = []
+            for chunk_idx, chunk in enumerate(split_chunks):
+                chunk_id = _chunk_id(document_id, sec_index, chunk_idx)
+                start_offset = parsed_sec["start_offset"] + int(
+                    chunk.metadata.get("start_index", 0)
+                )
+                page_number = _page_number_at_offset(
+                    start_offset,
+                    page_boundaries,
+                )
+                metadata = {
+                    "document_id": document_id,
+                    "section_id": section_uuid,
+                    "source_id": source_id,
+                    "chunk_id": chunk_id,
+                    "source": source_name,
+                    "page_number": page_number,
+                    "section_title": str(db_sec["section_title"]),
+                    "role": role,
+                    "allowed_roles": approved_roles,
+                    "classification_method": classification.classification_method,
+                    "classification_confidence": classification.classification_confidence,
+                }
+                role_docs.append(
+                    Document(
+                        page_content=chunk.page_content,
+                        metadata=normalize_chroma_metadata(metadata),
+                    )
+                )
+                role_ids.append(chunk_id)
+
+            missing_ids = [
+                cid
+                for cid in role_ids
+                if not _collection_already_has_id(collection, cid)
+            ]
+            if missing_ids:
+                docs_to_add = [
+                    doc_obj
+                    for doc_obj, cid in zip(role_docs, role_ids)
+                    if cid in set(missing_ids)
+                ]
+                collection.add_documents(documents=docs_to_add, ids=missing_ids)
+
+            verify_result = collection.get(
+                ids=role_ids,
+                include=["metadatas"],
+            )
+            stored_ids = (
+                verify_result.get("ids")
+                if isinstance(verify_result, Mapping)
+                else None
+            )
+            stored_metas = (
+                verify_result.get("metadatas")
+                if isinstance(verify_result, Mapping)
+                else None
+            )
+            if (
+                not isinstance(stored_ids, list)
+                or not isinstance(stored_metas, list)
+                or set(stored_ids) != set(role_ids)
+                or len(stored_metas) != len(stored_ids)
+            ):
+                raise RuntimeError(
+                    f"ChromaDB verification failed for role '{role}', section {sec_index}."
+                )
+            for meta in stored_metas:
+                if (
+                    not isinstance(meta, Mapping)
+                    or meta.get("document_id") != document_id
+                    or meta.get("section_id") != section_uuid
+                    or meta.get("role") != role
+                ):
+                    raise RuntimeError(
+                        f"ChromaDB metadata ownership mismatch for role '{role}'."
+                    )
+
+            chunk_ids_by_role[role] = role_ids
+            verified_collections.add(role)
+            total_verified_chunks += len(role_ids)
+
+        section_chunks_payload.append({
+            "section_id": section_uuid,
+            "chunk_ids_by_role": chunk_ids_by_role,
+        })
+
+    return section_chunks_payload, verified_collections, total_verified_chunks
+
+
+def rehydrate_indexed_document(
+    document_path: Path,
+    document_id: str,
+    *,
+    doc: Mapping[str, Any] | None = None,
+    collections: Mapping[str, Any] | None = None,
+    logical_filename: str | None = None,
+) -> dict[str, Any]:
+    """Re-populate ephemeral ChromaDB for an already approved & indexed document."""
+
+    from src.api.services import local_rag_store
+
+    if not isinstance(document_path, Path):
+        raise TypeError("document_path must be a pathlib.Path")
+
+    resolved_path = document_path.resolve(strict=True)
+    record = doc if doc is not None else local_rag_store.get_document_by_id(document_id)
+    if record is None:
+        raise RuntimeError(f"Document {document_id} not found in Supabase.")
+    if (
+        record.get("approval_status") != "approved"
+        or record.get("indexing_status") != "indexed"
+    ):
+        raise RuntimeError("Only approved and indexed documents can be rehydrated.")
+
+    file_hash = hashlib.sha256()
+    with resolved_path.open("rb") as document_file:
+        for file_chunk in iter(lambda: document_file.read(1024 * 1024), b""):
+            file_hash.update(file_chunk)
+    actual_hash = file_hash.hexdigest().lower()
+    if actual_hash != record.get("file_hash_sha256"):
+        raise RuntimeError(
+            "Document file hash does not match the indexed Supabase record."
+        )
+
+    source_id = str(record["source_id"])
+    source_name = (
+        Path(logical_filename).name
+        if logical_filename and logical_filename.strip()
+        else str(record.get("filename") or resolved_path.name)
+    )
+    target_collections = (
+        dict(collections) if collections is not None else initialize_collections()
+    )
+    _, verified_collections, total_verified_chunks = _write_approved_sections_to_chroma(
+        resolved_path,
+        document_id,
+        source_id,
+        source_name,
+        target_collections,
+    )
+    return {
+        "document_id": document_id,
+        "approval_status": "approved",
+        "indexing_status": "indexed",
+        "verified_chunk_count": total_verified_chunks,
+        "verified_collections": sorted(verified_collections),
+    }
+
+
 def index_approved_document(
     document_path: Path,
     document_id: str,
@@ -1330,151 +1560,17 @@ def index_approved_document(
     )
 
     try:
-        loaded_documents = load_document(resolved_path)
-        parsed_sections, _, page_boundaries = _identify_sections(
-            loaded_documents,
+        (
+            section_chunks_payload,
+            verified_collections,
+            total_verified_chunks,
+        ) = _write_approved_sections_to_chroma(
+            resolved_path,
+            document_id,
+            source_id,
             source_name,
+            target_collections,
         )
-        db_sections = local_rag_store.get_document_sections(document_id)
-        approved_sections = [
-            sec for sec in db_sections if sec.get("review_status") == "approved"
-        ]
-        if not approved_sections:
-            raise RuntimeError("No approved sections exist to index.")
-
-        section_chunks_payload: list[dict[str, Any]] = []
-        verified_collections: set[str] = set()
-        total_verified_chunks = 0
-
-        for db_sec in approved_sections:
-            sec_index = int(db_sec["section_index"])
-            if sec_index < 0 or sec_index >= len(parsed_sections):
-                raise RuntimeError(
-                    f"Approved section index {sec_index} is missing from document."
-                )
-            parsed_sec = parsed_sections[sec_index]
-            parsed_hash = hashlib.sha256(
-                parsed_sec["text"].encode("utf-8")
-            ).hexdigest().lower()
-            if parsed_hash != db_sec.get("section_sha256"):
-                raise RuntimeError(
-                    f"Section {sec_index} content hash mismatch against approved record."
-                )
-
-            approved_roles = list(db_sec.get("approved_roles") or [])
-            if not approved_roles:
-                raise RuntimeError(
-                    f"Approved section {sec_index} has no approved_roles."
-                )
-
-            classification = ClassificationResult(
-                section_title=str(db_sec["section_title"]),
-                section_text=parsed_sec["text"],
-                allowed_roles=approved_roles,
-                classification_method=str(
-                    db_sec.get("classification_method") or "groq_llm"
-                ),
-                classification_confidence=float(
-                    db_sec.get("classification_confidence")
-                    if db_sec.get("classification_confidence") is not None
-                    else 1.0
-                ),
-                review_required=False,
-            )
-            split_chunks = split_classified_section(classification)
-            section_uuid = str(db_sec["id"])
-            chunk_ids_by_role: dict[str, list[str]] = {}
-
-            for role in approved_roles:
-                collection = target_collections[role]
-                role_docs: list[Document] = []
-                role_ids: list[str] = []
-                for chunk_idx, chunk in enumerate(split_chunks):
-                    chunk_id = _chunk_id(document_id, sec_index, chunk_idx)
-                    start_offset = parsed_sec["start_offset"] + int(
-                        chunk.metadata.get("start_index", 0)
-                    )
-                    page_number = _page_number_at_offset(
-                        start_offset,
-                        page_boundaries,
-                    )
-                    metadata = {
-                        "document_id": document_id,
-                        "section_id": section_uuid,
-                        "source_id": source_id,
-                        "chunk_id": chunk_id,
-                        "source": source_name,
-                        "page_number": page_number,
-                        "section_title": str(db_sec["section_title"]),
-                        "role": role,
-                        "allowed_roles": approved_roles,
-                        "classification_method": classification.classification_method,
-                        "classification_confidence": classification.classification_confidence,
-                    }
-                    role_docs.append(
-                        Document(
-                            page_content=chunk.page_content,
-                            metadata=normalize_chroma_metadata(metadata),
-                        )
-                    )
-                    role_ids.append(chunk_id)
-
-                missing_ids = [
-                    cid
-                    for cid in role_ids
-                    if not _collection_already_has_id(collection, cid)
-                ]
-                if missing_ids:
-                    docs_to_add = [
-                        doc_obj
-                        for doc_obj, cid in zip(role_docs, role_ids)
-                        if cid in set(missing_ids)
-                    ]
-                    collection.add_documents(documents=docs_to_add, ids=missing_ids)
-
-                # Verify actual ChromaDB presence, ownership, and role parity
-                verify_result = collection.get(
-                    ids=role_ids,
-                    include=["metadatas"],
-                )
-                stored_ids = (
-                    verify_result.get("ids")
-                    if isinstance(verify_result, Mapping)
-                    else None
-                )
-                stored_metas = (
-                    verify_result.get("metadatas")
-                    if isinstance(verify_result, Mapping)
-                    else None
-                )
-                if (
-                    not isinstance(stored_ids, list)
-                    or not isinstance(stored_metas, list)
-                    or set(stored_ids) != set(role_ids)
-                    or len(stored_metas) != len(stored_ids)
-                ):
-                    raise RuntimeError(
-                        f"ChromaDB verification failed for role '{role}', section {sec_index}."
-                    )
-                for meta in stored_metas:
-                    if (
-                        not isinstance(meta, Mapping)
-                        or meta.get("document_id") != document_id
-                        or meta.get("section_id") != section_uuid
-                        or meta.get("role") != role
-                    ):
-                        raise RuntimeError(
-                            f"ChromaDB metadata ownership mismatch for role '{role}'."
-                        )
-
-                chunk_ids_by_role[role] = role_ids
-                verified_collections.add(role)
-                total_verified_chunks += len(role_ids)
-
-            section_chunks_payload.append({
-                "section_id": section_uuid,
-                "chunk_ids_by_role": chunk_ids_by_role,
-            })
 
         updated_doc = local_rag_store.complete_indexing(
             document_id=document_id,
