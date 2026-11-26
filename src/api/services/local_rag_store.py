@@ -649,3 +649,56 @@ def match_pgvector_chunks(
             "match_local_rag_chunks returned malformed results."
         )
     return [dict(r) for r in rows]
+
+
+def delete_document(
+    *,
+    document_id: str,
+    actor_id: str,
+) -> dict[str, Any]:
+    """Hard-delete a document, its sections, and its pgvector chunks via controlled RPC."""
+
+    return _call_rpc(
+        "local_rag_delete_document",
+        {
+            "p_document_id": _normalize_uuid(document_id, "document_id"),
+            "p_actor_id": _normalize_uuid(actor_id, "actor_id"),
+        },
+    )
+
+
+def delete_source_file(
+    file_hash_sha256: str,
+    filename: str,
+) -> bool:
+    """Delete a source document from Supabase Storage; return False if already absent."""
+
+    base_url, headers = _supabase_headers_and_base()
+    bucket = settings.SUPABASE_STORAGE_BUCKET
+    object_path = storage_object_path(file_hash_sha256, filename)
+    encoded_path = quote(object_path, safe="/")
+    endpoint = f"{base_url}/storage/v1/object/{bucket}/{encoded_path}"
+
+    delete_headers = {
+        "apikey": headers["apikey"],
+        "Authorization": headers["Authorization"],
+    }
+    try:
+        response = httpx.delete(
+            endpoint,
+            headers=delete_headers,
+            timeout=30.0,
+            follow_redirects=False,
+        )
+    except httpx.RequestError as exc:
+        raise LocalRagStoreUnavailable(
+            "Failed to delete source document from Supabase Storage."
+        ) from exc
+
+    if response.status_code in {400, 404}:
+        return False
+    if response.status_code not in {200, 204}:
+        raise LocalRagStoreUnavailable(
+            f"Supabase Storage delete failed with HTTP {response.status_code}."
+        )
+    return True

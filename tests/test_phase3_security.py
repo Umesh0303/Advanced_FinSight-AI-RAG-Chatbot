@@ -291,6 +291,10 @@ def test_admin_document_endpoints_enforce_admin_and_workflow(monkeypatch):
             headers=bearer(make_token(cust_key)),
             json={"decision_reason": "no"},
         ).status_code == 403
+        assert client.delete(
+            f"/api/v1/documents/{doc_id}",
+            headers=bearer(make_token(cust_key)),
+        ).status_code == 403
 
         # Admin allowed
         admin_key = configure_auth(monkeypatch, application_role="Admin")
@@ -328,6 +332,36 @@ def test_admin_document_endpoints_enforce_admin_and_workflow(monkeypatch):
         assert revoke_resp.status_code == 200
         assert revoke_resp.json()["removed_chunks"] == 3
         assert collections["customer"].stored == {}
+
+        # Admin delete removes DB record, pgvector chunks, and storage object
+        deleted_storage_calls: list[tuple[str, str]] = []
+        monkeypatch.setattr(
+            store,
+            "delete_document",
+            lambda **kw: {
+                "document_id": doc_id,
+                "filename": "policy.pdf",
+                "file_hash_sha256": "a" * 64,
+                "deleted_chunks": 4,
+            },
+        )
+        monkeypatch.setattr(
+            store,
+            "delete_source_file",
+            lambda h, fn: deleted_storage_calls.append((h, fn)) or True,
+        )
+        del_resp = client.delete(
+            f"/api/v1/documents/{doc_id}",
+            headers=bearer(make_token(admin_key)),
+        )
+        assert del_resp.status_code == 200
+        del_body = del_resp.json()
+        assert del_body["success"] is True
+        assert del_body["status"] == "deleted"
+        assert del_body["document_id"] == doc_id
+        assert del_body["deleted_chunks"] == 4
+        assert del_body["storage_deleted"] is True
+        assert deleted_storage_calls == [("a" * 64, "policy.pdf")]
 
 
 def test_sync_approved_documents_rehydrates_already_indexed_doc(tmp_path, monkeypatch):

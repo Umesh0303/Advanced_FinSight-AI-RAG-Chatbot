@@ -207,3 +207,26 @@ def test_classifier_quarantined_requires_json_boolean():
     assert match is not None
     body = match.group(0)
     assert "pg_catalog.jsonb_typeof(v_sec->'classifier_quarantined') <> 'boolean'" in body
+
+
+def test_optional_quarantine_reason_migration_preserves_security():
+    opt_path = MIGRATION_PATH.parent / "202611260002_optional_quarantine_reason.sql"
+    sql = re.sub(r"--[^\n]*", "", opt_path.read_text(encoding="utf-8"))
+    assert "DROP CONSTRAINT IF EXISTS local_rag_sections_quarantine_resolution_chk" in sql
+    assert "SET search_path = pg_catalog, public, pg_temp" in sql
+    assert "public.local_rag_assert_active_admin(p_actor_id)" in sql
+    assert "v_doc.approval_status IS DISTINCT FROM 'pending'" in sql
+    assert "Quarantined section % requires" not in sql
+
+
+def test_delete_document_migration_preserves_security():
+    del_path = MIGRATION_PATH.parent / "202611260003_local_rag_delete_document.sql"
+    sql = re.sub(r"--[^\n]*", "", del_path.read_text(encoding="utf-8"))
+    assert "'document_deleted'" in sql
+    assert "'delete_document'" in sql
+    assert "CREATE OR REPLACE FUNCTION public.local_rag_delete_document(" in sql
+    assert "SET search_path = pg_catalog, public, pg_temp" in sql
+    assert "public.local_rag_assert_active_admin(p_actor_id)" in sql
+    assert "v_doc.indexing_status = 'indexing'" in sql
+    assert "REVOKE ALL ON FUNCTION public.local_rag_delete_document(uuid, uuid) FROM PUBLIC, anon, authenticated;" in sql
+    assert "GRANT EXECUTE ON FUNCTION public.local_rag_delete_document(uuid, uuid) TO service_role;" in sql

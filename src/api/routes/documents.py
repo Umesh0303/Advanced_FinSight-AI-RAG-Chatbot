@@ -192,6 +192,63 @@ def revoke_document(
     }
 
 
+@router.delete("/{document_id}")
+def delete_document(
+    document_id: str,
+    request: Request,
+    principal: AuthenticatedPrincipal = Depends(require_admin),
+) -> dict[str, Any]:
+    """Delete a document from Supabase (registry, sections, pgvector), Storage, and Chroma."""
+
+    try:
+        deleted = local_rag_store.delete_document(
+            document_id=document_id,
+            actor_id=principal.user_id,
+        )
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_CONTENT,
+            detail="Invalid document ID.",
+        ) from None
+    except local_rag_store.LocalRagStoreError as exc:
+        raise _handle_store_error(exc) from None
+
+    storage_deleted = False
+    file_hash = deleted.get("file_hash_sha256")
+    filename = deleted.get("filename")
+    if isinstance(file_hash, str) and isinstance(filename, str) and file_hash and filename:
+        try:
+            storage_deleted = local_rag_store.delete_source_file(file_hash, filename)
+        except Exception:
+            logger.warning(
+                "Supabase Storage cleanup failed after deleting document %s.",
+                document_id,
+            )
+
+    removed_chunks = int(deleted.get("deleted_chunks") or 0)
+    collections = getattr(request.app.state, "collections", None)
+    if isinstance(collections, Mapping) and collections.get("backend") != "pgvector":
+        try:
+            removed_chunks += remove_document_chunks_from_chroma(
+                document_id,
+                collections,
+            )
+        except Exception:
+            logger.warning(
+                "ChromaDB cleanup failed after deleting document %s.",
+                document_id,
+            )
+
+    return {
+        "success": True,
+        "status": "deleted",
+        "document_id": str(deleted.get("document_id") or document_id),
+        "filename": filename,
+        "deleted_chunks": removed_chunks,
+        "storage_deleted": storage_deleted,
+    }
+
+
 @router.post("/{document_id}/index")
 async def index_document_endpoint(
     document_id: str,
