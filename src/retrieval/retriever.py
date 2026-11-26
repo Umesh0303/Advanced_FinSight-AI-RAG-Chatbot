@@ -2,11 +2,12 @@
 
 import json
 import math
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
 from langchain_core.documents import Document
 
+from src.api.services import local_rag_store
 from src.config.settings import ALLOWED_ROLES
 from src.retrieval.role_router import get_role_collections
 from src.security.access_control import validate_role
@@ -76,11 +77,17 @@ def retrieve_documents(
     role: str,
     collections: Mapping[str, Any],
     top_k: int = 5,
+    supabase_verifier: Callable[
+        [Sequence[tuple[str, str]], str],
+        set[tuple[str, str]],
+    ] | None = None,
 ) -> list[Document]:
     """Return the top unique, authorized chunks for a role and query.
 
     The collection mapping is supplied by the caller; this function neither
-    initializes ChromaDB nor authenticates the requested role.
+    initializes ChromaDB nor authenticates the requested role. Candidate chunks
+    are verified against authoritative Supabase approval and section-role records
+    before being returned.
     """
 
     validated_role = validate_role(role)
@@ -174,4 +181,43 @@ def retrieve_documents(
         key=lambda item: item[0],
         reverse=True,
     )
-    return [document for _, document in ranked[:top_k]]
+    if not ranked:
+        return []
+
+    verify_fn = (
+        local_rag_store.verify_chunks_for_retrieval
+        if supabase_verifier is None
+        else supabase_verifier
+    )
+    candidate_pairs: list[tuple[str, str]] = []
+    for _, document in ranked:
+        doc_id = document.metadata.get("document_id")
+        sec_id = document.metadata.get("section_id")
+        if _valid_non_empty_string(doc_id) and _valid_non_empty_string(sec_id):
+            candidate_pairs.append((doc_id, sec_id))
+
+    if not candidate_pairs:
+        return []
+
+    try:
+        authorized_pairs = verify_fn(candidate_pairs, validated_role)
+    except Exception as exc:
+        raise RuntimeError(
+            "Supabase retrieval authorization verification failed."
+        ) from exc
+
+    if not isinstance(authorized_pairs, set):
+        raise RuntimeError(
+            "Supabase retrieval authorization returned malformed data."
+        )
+
+    authorized_docs: list[Document] = []
+    for _, document in ranked:
+        doc_id = document.metadata.get("document_id")
+        sec_id = document.metadata.get("section_id")
+        if (doc_id, sec_id) in authorized_pairs:
+            authorized_docs.append(document)
+            if len(authorized_docs) >= top_k:
+                break
+
+    return authorized_docs

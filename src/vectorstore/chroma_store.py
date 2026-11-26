@@ -12,6 +12,7 @@ from src.embeddings.embedding_model import get_embedding_model
 
 SECURITY_METADATA_FIELDS: tuple[str, ...] = (
     "document_id",
+    "section_id",
     "source_id",
     "chunk_id",
     "source",

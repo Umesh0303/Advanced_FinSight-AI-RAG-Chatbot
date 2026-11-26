@@ -23,7 +23,14 @@ class MockCollection:
 
 
 @pytest.fixture
-def collections():
+def collections(monkeypatch):
+    import src.api.services.local_rag_store as local_rag_store
+
+    monkeypatch.setattr(
+        local_rag_store,
+        "verify_chunks_for_retrieval",
+        lambda refs, role: set(refs),
+    )
     return {
         name: MockCollection()
         for name in (*COLLECTION_NAMES, "unauthorized_extra")
@@ -33,6 +40,7 @@ def collections():
 def make_document(
     chunk_id="chunk-1",
     document_id="document-1",
+    section_id="section-1",
     role="customer",
     allowed_roles=None,
     content="retrieved content",
@@ -41,6 +49,7 @@ def make_document(
     metadata = {
         "chunk_id": chunk_id,
         "document_id": document_id,
+        "section_id": section_id,
         "role": role,
         "allowed_roles": json.dumps(
             allowed_roles if allowed_roles is not None else [role]

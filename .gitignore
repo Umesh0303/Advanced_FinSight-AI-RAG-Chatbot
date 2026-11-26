@@ -22,3 +22,4 @@ Thumbs.db
 # Local ingestion state and quarantined documents
 data/ingestion_manifest.json
 data/unclassified/
+backups/

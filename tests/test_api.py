@@ -644,7 +644,7 @@ def test_initialize_api_resources_continues_if_startup_ingestion_fails(monkeypat
     monkeypatch.setattr(api_main, "initialize_collections", lambda embedding_model: fake_collections)
     monkeypatch.setattr(
         api_main,
-        "ingest_uploads_if_empty",
+        "sync_approved_documents_if_empty",
         lambda collections: (_ for _ in ()).throw(RuntimeError("missing hmac key")),
     )
 

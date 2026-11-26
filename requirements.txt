@@ -13,3 +13,4 @@ fastapi
 uvicorn[standard]
 PyJWT[crypto]
 httpx
+python-multipart
