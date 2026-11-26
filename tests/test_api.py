@@ -533,6 +533,18 @@ def test_cors_allows_configured_origin_only(api_client):
     assert allowed.headers["access-control-allow-origin"] == _CORS_ORIGIN
     assert "access-control-allow-origin" not in denied.headers
 
+    allowed_delete = api_client.options(
+        "/api/v1/documents/00000000-0000-0000-0000-000000000000",
+        headers={
+            "Origin": _CORS_ORIGIN,
+            "Access-Control-Request-Method": "DELETE",
+            "Access-Control-Request-Headers": "authorization",
+        },
+    )
+    assert allowed_delete.status_code == 200
+    assert allowed_delete.headers["access-control-allow-origin"] == _CORS_ORIGIN
+    assert "DELETE" in allowed_delete.headers["access-control-allow-methods"]
+
 
 def test_generated_session_id_is_valid_uuid(api_client, monkeypatch):
     private_key = configure_auth(monkeypatch)
